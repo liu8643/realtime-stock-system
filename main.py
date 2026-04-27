@@ -1,8 +1,10 @@
-# v5.0.2 完整版
-# 已修正：
-# 1. TWSE MIS 五檔欄位 mapping
-# 2. 下方左右文字區加入垂直/水平 scrollbar
-# 3. 大跌時強制壓低分數，避免誤判「強勢買進」
+# v5.1.8 Phase1+Phase2+Phase3 最終整合版
+# 已整合：
+# 1. 波浪理論結構化欄位 wave_stage / wave_score / wave_risk_flag
+# 2. 費波南西位置欄位 fibo_position / fibo_score / fibo_risk_flag
+# 3. Decision Layer：final_decision / execution_ready / decision_reason
+# 4. UI / CSV / PDF / TXT 同步顯示波費與最終決策
+# 5. RR 閘門與禁追風險優先級
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -19,8 +21,8 @@ import os
 import csv
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.8-WaveFibo-DecisionLayer"
-DECISION_MODEL_VERSION = "WF-DL-20260427-PHASE1"
+APP_VERSION = "v5.1.8-Phase123-WaveFibo-DecisionLayer-FINAL"
+DECISION_MODEL_VERSION = "WF-DL-20260427-PHASE123-FINAL"
 AUTO_REFRESH_MS = 30000
 
 def setup_pdf_font():
@@ -843,9 +845,9 @@ def build_final_decision(result: dict) -> dict:
         ready = False
         reason = f"命中風險訊號：{signal}。"
     elif fibo_risk or wave_risk:
-        decision = "WAIT"
+        decision = "AVOID"
         ready = False
-        reason = "波浪/費波觸發禁追或末升風險。"
+        reason = "波浪/費波觸發禁追或末升風險，不允許追價。"
     elif rr is None or rr < 1:
         decision = "WAIT"
         ready = False
@@ -1745,11 +1747,11 @@ class GTCProApp:
         columns = (
             "排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%",
             "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選", "波浪定位", "費波位置", "禁追提示", "波費判定", "波段分", "盤中分", "支撐", "壓力", "RSI",
-            "五檔力道", "交易類型", "報價說明"
+            "五檔力道", "交易類型", "最終決策", "可下單", "決策原因", "報價說明"
         )
         self.all_columns = columns
-        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選", "波浪定位", "費波位置", "禁追提示", "波費判定")
-        self.advanced_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選", "波浪定位", "費波位置", "禁追提示", "波費判定", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "報價說明")
+        self.core_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌幅%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選", "波浪定位", "費波位置", "禁追提示", "波費判定", "最終決策", "可下單")
+        self.advanced_columns = ("排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌", "漲跌幅%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選", "波浪定位", "費波位置", "禁追提示", "波費判定", "波段分", "盤中分", "支撐", "壓力", "RSI", "五檔力道", "交易類型", "最終決策", "可下單", "決策原因", "報價說明")
         self.tree = ttk.Treeview(parent, columns=columns, show="headings", height=16)
         self.tree.configure(displaycolumns=self.core_columns)
         widths = {
@@ -1757,7 +1759,7 @@ class GTCProApp:
             "漲跌": 90, "漲跌幅%": 95, "訊號": 100, "建議": 130, "分數": 65, "等級": 60, "目標價": 90, "RR": 70, "主升候選": 90,
             "波浪定位": 100, "費波位置": 130, "禁追提示": 90, "波費判定": 220,
             "波段分": 70, "盤中分": 70, "支撐": 90, "壓力": 90, "RSI": 70,
-            "五檔力道": 110, "交易類型": 100, "報價說明": 180
+            "五檔力道": 110, "交易類型": 100, "最終決策": 90, "可下單": 80, "決策原因": 260, "報價說明": 180
         }
         for c in columns:
             self.tree.heading(c, text=c, command=lambda col=c: self.sort_by_column(col))
@@ -1910,7 +1912,7 @@ class GTCProApp:
                     r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"], r.get("wave_stage", "-"), r.get("fibo_position", "-"),
                     "是" if (r.get("fibo_risk_flag") or r.get("wave_risk_flag")) else "否", r.get("wave_fibo_signal", "-"),
                     r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
-                    r["rsi"], r["orderbook_bias"], r["trade_type"], r["display_note"]
+                    r["rsi"], r["orderbook_bias"], r["trade_type"], r.get("final_decision", "-"), "是" if r.get("execution_ready") else "否", r.get("decision_reason", "-"), r["display_note"]
                 ),
                 tags=tuple(tags)
             )
@@ -2216,6 +2218,9 @@ class GTCProApp:
             "RSI": "rsi",
             "五檔力道": "orderbook_bias",
             "交易類型": "trade_type",
+            "最終決策": "final_decision",
+            "可下單": "execution_ready",
+            "決策原因": "decision_reason",
             "報價說明": "display_note",
         }
         real_key = key_map.get(col_name)
@@ -2251,8 +2256,8 @@ class GTCProApp:
         font_name = setup_pdf_font()
         c = canvas.Canvas(file_path, pagesize=landscape(A4))
         width, height = self._export_pdf_header(c, font_name, "總表摘要")
-        headers = ["排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌%", "訊號", "建議", "分數", "等級", "目標價", "RR", "主升候選"]
-        x_positions = [18, 50, 88, 145, 200, 330, 395, 465, 540, 630, 680, 730, 790, 845]
+        headers = ["排名", "燈號", "市場", "代號", "名稱", "顯示價", "漲跌%", "訊號", "建議", "分數", "RR", "波浪", "費波", "禁追", "決策"]
+        x_positions = [18, 48, 82, 135, 185, 300, 360, 425, 490, 560, 605, 650, 710, 785, 825]
         y = height - 82
         c.setFont(font_name, 8)
         for h, x in zip(headers, x_positions):
@@ -2267,9 +2272,10 @@ class GTCProApp:
                 y = height - 50
                 c.setFont(font_name, 8)
             row = [
-                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:10], str(r["display_price"]),
-                f"{r['change_pct']:+.2f}%", r["signal"][:8], r["advice"][:8], str(r["score"]),
-                r["strategy_level"], str(r["display_target_price"]), str(r["display_rr"]), r["leader_candidate"]
+                str(idx), r["light"], r["market"], r["input_symbol"], r["name"][:9], str(r["display_price"]),
+                f"{r['change_pct']:+.2f}%", r["signal"][:7], r["advice"][:7], str(r["score"]),
+                str(r["display_rr"]), str(r.get("wave_stage", "-"))[:6], str(r.get("fibo_position", "-"))[:8],
+                "是" if (r.get("fibo_risk_flag") or r.get("wave_risk_flag")) else "否", str(r.get("final_decision", "-"))
             ]
             for text, x in zip(row, x_positions):
                 c.drawString(x, y, str(text))

@@ -1,0 +1,32 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
+        pip install pyinstaller
+
+    - name: Build EXE
+      run: |
+        pyinstaller --onefile --noconsole main.py --hidden-import=reportlab --hidden-import=reportlab.platypus --hidden-import=reportlab.lib --hidden-import=reportlab.pdfgen --hidden-import=reportlab.pdfbase --hidden-import=reportlab.pdfbase.ttfonts
+
+    - name: Upload EXE
+      uses: actions/upload-artifact@v3
+      with:
+        name: GTC_EXE
+        path: dist/main.exe

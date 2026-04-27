@@ -9,24 +9,25 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-    - name: Setup Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.10'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
 
-    - name: Install dependencies
-      run: |
-        pip install -r requirements.txt
-        pip install pyinstaller
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
 
-    - name: Build EXE
-      run: |
-        pyinstaller --onefile --noconsole main.py --hidden-import=reportlab --hidden-import=reportlab.platypus --hidden-import=reportlab.lib --hidden-import=reportlab.pdfgen --hidden-import=reportlab.pdfbase --hidden-import=reportlab.pdfbase.ttfonts
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --noconsole main.py --hidden-import=reportlab --hidden-import=reportlab.platypus --hidden-import=reportlab.lib --hidden-import=reportlab.pdfgen --hidden-import=reportlab.pdfbase --hidden-import=reportlab.pdfbase.ttfonts
 
-    - name: Upload EXE
-      uses: actions/upload-artifact@v3
-      with:
-        name: GTC_EXE
-        path: dist/main.exe
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: GTC_EXE
+          path: dist/main.exe

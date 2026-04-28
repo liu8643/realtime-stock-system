@@ -1,4 +1,4 @@
-# v5.1.9 Phase4 機構級交易引擎最終整合版
+# v5.2.0 Phase4 Takeover 機構級交易引擎接管版
 # 已整合：
 # 1. 波浪理論結構化欄位 wave_stage / wave_score / wave_risk_flag
 # 2. 費波南西位置欄位 fibo_position / fibo_score / fibo_risk_flag
@@ -20,13 +20,24 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 import os
 import csv
+import logging
 
 APP_TITLE = "GTC 股票專業版看盤分析系統"
-APP_VERSION = "v5.1.9-Phase4-InstitutionalExecutionEngine-FINAL"
-DECISION_MODEL_VERSION = "EXEC-P4-20260427-FINAL"
+APP_VERSION = "v5.2.0-Phase4-Takeover-FINAL"
+DECISION_MODEL_VERSION = "EXEC-P4-TAKEOVER-20260428"
 AUTO_REFRESH_MS = 30000
 DEFAULT_ACCOUNT_CAPITAL = 1000000
 DEFAULT_RISK_PCT = 1.0
+MIN_BUY_RR = 1.5
+MIN_BUY_ALLOCATION_SCORE = 70
+
+LOG_FILE = "gtc_phase4_decision.log"
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8"
+)
 
 
 def setup_pdf_font():
@@ -946,7 +957,7 @@ def calc_wave_rr_risk_allocation(result: dict) -> dict:
 
     if rr >= 2.0:
         score += 20
-    elif rr >= 1.5:
+    elif rr >= MIN_BUY_RR:
         score += 12
     elif rr >= 1.0:
         score += 3
@@ -1034,12 +1045,91 @@ def calc_position_sizing(result: dict, account_capital=DEFAULT_ACCOUNT_CAPITAL, 
         "max_loss_pct": max_loss_pct,
     }
 
+
+def ensure_phase4_fields(result: dict) -> dict:
+    """Phase4欄位完整性防呆：避免UI/CSV/PDF因缺欄造成KeyError或錯誤下單。"""
+    defaults = {
+        "entry_zone_status": "NO_PLAN",
+        "entry_zone_ready": False,
+        "entry_zone_reason": "Phase4欄位未完整產生，系統降級等待。",
+        "distance_to_entry_pct": 0.0,
+        "chase_risk_flag": False,
+        "allocation_score": 0,
+        "allocation_grade": "BLOCK",
+        "allocation_multiplier": 0.0,
+        "position_size_pct": 0.0,
+        "risk_budget_pct": 0.0,
+        "suggested_shares": 0,
+        "max_loss_pct": 0.0,
+        "phase4_block_reason": "Phase4欄位未完整產生，禁止下單。",
+        "order_type_hint": "等待",
+        "final_decision": "WAIT",
+        "execution_ready": False,
+        "decision_reason": "Phase4欄位未完整產生，系統降級等待。",
+        "final_block_reason": "Phase4欄位未完整產生，系統降級等待。",
+        "display_advice": result.get("advice", "觀望為主"),
+        "display_trade_type": result.get("trade_type", "觀望"),
+    }
+    missing = []
+    for key, value in defaults.items():
+        if key not in result or result.get(key) is None:
+            result[key] = value
+            missing.append(key)
+    if missing:
+        logging.warning("PHASE4_MISSING_FIELDS symbol=%s missing=%s", result.get("input_symbol", "-"), ",".join(missing))
+    return result
+
+
+def sync_display_semantics(result: dict) -> dict:
+    """用final_decision統一UI/CSV/PDF的人類語義，避免強勢追蹤但不可下單的誤判。"""
+    decision = result.get("final_decision", "WAIT")
+    entry_status = result.get("entry_zone_status", "-")
+    block_reason = result.get("final_block_reason") or result.get("phase4_block_reason") or result.get("decision_reason", "")
+    raw_advice = result.get("advice", "觀望為主")
+    raw_trade_type = result.get("trade_type", "觀望")
+
+    if decision == "BUY":
+        result["display_advice"] = raw_advice
+        result["display_trade_type"] = result.get("order_type_hint") or raw_trade_type
+    elif decision == "AVOID":
+        result["display_advice"] = "禁止進場/風控"
+        result["display_trade_type"] = "禁止"
+        result["final_block_reason"] = block_reason or "Phase4風控條件未通過，禁止下單。"
+    else:
+        if entry_status == "ABOVE_ENTRY":
+            result["display_advice"] = "等待回測/不追價"
+        elif entry_status == "WAIT_PULLBACK":
+            result["display_advice"] = "等待止穩/僅觀察"
+        elif result.get("allocation_score", 0) < MIN_BUY_ALLOCATION_SCORE:
+            result["display_advice"] = "等待條件改善"
+        else:
+            result["display_advice"] = "等待確認/僅觀察"
+        result["display_trade_type"] = "等待"
+        result["final_block_reason"] = block_reason or result.get("decision_reason", "未符合可下單條件。")
+    return result
+
+
+def log_decision_trace(result: dict) -> None:
+    """記錄每檔股票Phase4 Gate，方便EXE問題追蹤。"""
+    try:
+        logging.info(
+            "DECISION symbol=%s price=%s source=%s entry=%s ready_entry=%s rr=%s rr_valid=%s alloc=%s grade=%s position=%s decision=%s execution_ready=%s order=%s reason=%s",
+            result.get("input_symbol"), result.get("close"), result.get("source"),
+            result.get("entry_zone_status"), result.get("entry_zone_ready"),
+            result.get("rr"), result.get("rr_valid"), result.get("allocation_score"),
+            result.get("allocation_grade"), result.get("position_size_pct"),
+            result.get("final_decision"), result.get("execution_ready"),
+            result.get("order_type_hint"), result.get("decision_reason")
+        )
+    except Exception as e:
+        logging.warning("DECISION_LOG_FAILED symbol=%s error=%s", result.get("input_symbol", "-"), e)
+
 def build_final_decision(result: dict) -> dict:
     price_valid = bool(result.get("price_valid", False))
     signal = result.get("signal", "")
     advice = result.get("advice", "")
     state = result.get("state_bucket", "range")
-    rr = result.get("rr")
+    rr = safe_float(result.get("rr"), None)
     rr_valid = bool(result.get("rr_valid", False))
     fibo_risk = bool(result.get("fibo_risk_flag", False))
     wave_risk = bool(result.get("wave_risk_flag", False))
@@ -1047,7 +1137,9 @@ def build_final_decision(result: dict) -> dict:
     entry_zone_status = result.get("entry_zone_status", "NO_PLAN")
     position_size_pct = safe_float(result.get("position_size_pct"), 0.0) or 0.0
     allocation_score = safe_float(result.get("allocation_score"), 0.0) or 0.0
+    allocation_grade = result.get("allocation_grade", "BLOCK")
     phase4_block_reason = result.get("phase4_block_reason", "")
+    entry_zone_reason = result.get("entry_zone_reason", "不符合進場區")
     order_type_hint = result.get("order_type_hint", "等待")
     support_broken = signal in ("急跌風險", "跌破支撐", "轉弱警戒")
 
@@ -1066,30 +1158,45 @@ def build_final_decision(result: dict) -> dict:
         ready = False
         reason = "波浪/費波觸發禁追或末升風險，不允許追價。"
         order_type_hint = "禁止"
+    elif allocation_grade == "BLOCK":
+        # Phase4硬Gate：資金等級BLOCK必須直接阻擋，避免被後續WAIT覆蓋成可觀察語義。
+        decision = "AVOID"
+        ready = False
+        reason = phase4_block_reason or "Phase4資金等級為BLOCK，禁止下單。"
+        order_type_hint = "禁止"
     elif entry_zone_status in ("ABOVE_ENTRY", "NO_CHASE", "BROKEN", "NO_PLAN"):
         decision = "AVOID" if entry_zone_status in ("NO_CHASE", "BROKEN") else "WAIT"
         ready = False
-        reason = f"Phase4進場區阻擋：{result.get('entry_zone_reason','不符合進場區')}。"
+        reason = f"Phase4進場區阻擋：{entry_zone_reason}。"
+        if decision == "AVOID":
+            order_type_hint = "禁止"
+        else:
+            order_type_hint = "等待"
     elif not entry_zone_ready:
         decision = "WAIT"
         ready = False
-        reason = f"尚未進入可執行進場區：{result.get('entry_zone_reason','等待確認')}。"
+        reason = f"尚未進入可執行進場區：{entry_zone_reason}。"
+        order_type_hint = "等待"
     elif rr is None or rr < 1:
         decision = "WAIT"
         ready = False
         reason = "RR小於1或無法計算，禁止買進。"
-    elif rr < 1.5:
+        order_type_hint = "等待"
+    elif rr < MIN_BUY_RR:
         decision = "WAIT"
         ready = False
-        reason = "RR介於1.0~1.5，僅觀察或小倉位等待。"
+        reason = f"RR介於1.0~{MIN_BUY_RR}，僅觀察或等待更佳風險報酬。"
+        order_type_hint = "等待"
     elif position_size_pct <= 0:
         decision = "WAIT"
         ready = False
         reason = phase4_block_reason or "倉位計算為0，禁止下單。"
-    elif allocation_score < 70:
+        order_type_hint = "等待"
+    elif allocation_score < MIN_BUY_ALLOCATION_SCORE:
         decision = "WAIT"
         ready = False
-        reason = phase4_block_reason or "配置分低於70，等待更佳進場條件。"
+        reason = phase4_block_reason or f"配置分低於{MIN_BUY_ALLOCATION_SCORE}，等待更佳進場條件。"
+        order_type_hint = "等待"
     elif state == "strong" and rr_valid and entry_zone_ready and advice in ("突破可追", "拉回加碼"):
         decision = "BUY"
         ready = True
@@ -1098,13 +1205,34 @@ def build_final_decision(result: dict) -> dict:
         decision = "WAIT"
         ready = False
         reason = "偏多但未達強勢買進，等待拉回或突破確認。"
+        order_type_hint = "等待"
     else:
         decision = "WAIT"
         ready = False
         reason = "未符合可下單條件。"
+        order_type_hint = "等待"
 
-    if decision != "BUY" and position_size_pct > 0:
+    # 後置Gate保護：未來維護時即使上方誤判BUY，也不能繞過Phase4硬條件。
+    gate_ready = (
+        decision == "BUY" and price_valid and entry_zone_ready and
+        position_size_pct > 0 and allocation_score >= MIN_BUY_ALLOCATION_SCORE and
+        rr_valid and rr is not None and rr >= MIN_BUY_RR and
+        allocation_grade not in ("BLOCK", "D") and
+        entry_zone_status in ("IN_ZONE", "BREAKOUT_CONFIRM") and
+        not (fibo_risk or wave_risk or support_broken)
+    )
+    if decision == "BUY" and not gate_ready:
+        decision = "WAIT"
+        ready = False
+        reason = "Phase4後置Gate未通過，降級等待。"
+        order_type_hint = "等待"
+    else:
+        ready = bool(gate_ready)
+
+    if decision != "BUY":
         position_size_pct = 0.0
+
+    final_block_reason = "" if decision == "BUY" else (phase4_block_reason or reason)
 
     return {
         "final_decision": decision,
@@ -1112,6 +1240,7 @@ def build_final_decision(result: dict) -> dict:
         "decision_reason": reason,
         "order_type_hint": order_type_hint,
         "position_size_pct": position_size_pct,
+        "final_block_reason": final_block_reason,
     }
 
 def get_light(signal, score, change_pct, intraday_score=None, fibo_risk_flag=False, wave_risk_flag=False, final_decision=None):
@@ -1347,7 +1476,7 @@ def calc_trade_plan(data: dict) -> dict:
     if rr is None:
         rr_valid = False
         rr_level = "無效"
-    elif rr >= 1.5:
+    elif rr >= MIN_BUY_RR:
         rr_valid = True
         rr_level = "有效"
     elif rr >= 1.0:
@@ -1661,6 +1790,9 @@ def analyze_symbol(symbol: str) -> dict:
     result.update(calc_position_sizing(result, account_capital=DEFAULT_ACCOUNT_CAPITAL, risk_pct=DEFAULT_RISK_PCT))
     result["wave_fibo_signal"] = build_wave_fibo_decision_note(result)
     result.update(build_final_decision(result))
+    result = ensure_phase4_fields(result)
+    result = sync_display_semantics(result)
+    log_decision_trace(result)
     result["risk_note"] = build_risk_note(
         close, support, resistance, rsi, score, change_pct,
         wave_stage=result["wave_stage"],
@@ -1671,6 +1803,7 @@ def analyze_symbol(symbol: str) -> dict:
         price_valid=price_valid
     )
     result["trade_type"] = classify_trade_type(state_bucket, signal, advice)
+    result = sync_display_semantics(result)
     result["leader_candidate"] = classify_leader_stage(result)
     result["leader_stage"] = result["leader_candidate"]
     risk_penalty = 18 if (result.get("fibo_risk_flag") or result.get("wave_risk_flag")) else 0
@@ -1682,12 +1815,15 @@ def analyze_symbol(symbol: str) -> dict:
         result.get("wave_score", 0) * 0.7 +
         result.get("fibo_score", 0) * 0.7 +
         result["change_pct"] * 1.2 +
+        (20 if result.get("execution_ready") else 0) +
         (12 if result.get("entry_zone_ready") else 0) +
         (10 if result.get("position_size_pct", 0) > 0 else 0) +
         (15 if result["leader_candidate"] == "是" else 0) +
         (6 if result["leader_candidate"] == "觀察" else 0) -
         risk_penalty -
-        (25 if result.get("allocation_grade") == "BLOCK" else 0)
+        (25 if result.get("allocation_grade") == "BLOCK" else 0) -
+        (12 if result.get("final_decision") == "WAIT" else 0) -
+        (28 if result.get("final_decision") == "AVOID" else 0)
     )
     result["light"] = get_light(
         result["signal"], result["score"], result["change_pct"],
@@ -1705,8 +1841,8 @@ def analyze_symbol(symbol: str) -> dict:
         f"波浪 / 費波 / 禁追：{result['wave_stage']} / {result['fibo_position']} / {'是' if (result['fibo_risk_flag'] or result['wave_risk_flag']) else '否'}",
         f"波費判定：{result['wave_fibo_signal']}",
         f"支撐 / 壓力 / 五檔：{result['support']} / {result['resistance']} / {result['orderbook_bias']}",
-        f"燈號 / 訊號 / 建議 / 主升狀態：{result['light']} / {result['signal']} / {result['advice']} / {result['leader_candidate']}",
-        f"交易類型 / 等級：{result['trade_type']} / {result['strategy_level']}",
+        f"燈號 / 訊號 / 建議 / 主升狀態：{result['light']} / {result['signal']} / {result.get('display_advice', result['advice'])} / {result['leader_candidate']}",
+        f"交易類型 / 等級：{result.get('display_trade_type', result['trade_type'])} / {result['strategy_level']}",
         f"目標價 / RR / RR等級：{result['display_target_price']} / {result['display_rr']} / {result['rr_level']}",
         f"Phase4：進場狀態={result.get('entry_zone_status','-')} / 倉位={result.get('position_size_pct',0)}% / 資金等級={result.get('allocation_grade','-')} / 配置分={result.get('allocation_score','-')}",
         f"最終決策 / 可下單 / 下單類型：{result['final_decision']} / {result['execution_ready']} / {result.get('order_type_hint','-')} / {result['decision_reason']}",
@@ -2164,11 +2300,11 @@ class GTCProApp:
                 "", "end",
                 values=(
                     idx, light, r["market"], r["input_symbol"], r["name"], r["display_price"],
-                    f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r["advice"],
+                    f"{r['change']:+.2f}", f"{r['change_pct']:+.2f}%", r["signal"], r.get("display_advice", r["advice"]),
                     r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"], r.get("wave_stage", "-"), r.get("fibo_position", "-"),
                     "是" if (r.get("fibo_risk_flag") or r.get("wave_risk_flag")) else "否", r.get("wave_fibo_signal", "-"),
                     r["trend_score"], r["intraday_score"], r["support"], r["resistance"],
-                    r["rsi"], r["orderbook_bias"], r["trade_type"], r.get("entry_zone_status", "-"), "是" if r.get("entry_zone_ready") else "否", r.get("position_size_pct", 0), r.get("allocation_grade", "-"), r.get("allocation_score", 0), r.get("phase4_block_reason", "-"), r.get("order_type_hint", "-"), r.get("final_decision", "-"), "是" if r.get("execution_ready") else "否", r.get("decision_reason", "-"), r["display_note"]
+                    r["rsi"], r["orderbook_bias"], r.get("display_trade_type", r["trade_type"]), r.get("entry_zone_status", "-"), "是" if r.get("entry_zone_ready") else "否", r.get("position_size_pct", 0), r.get("allocation_grade", "-"), r.get("allocation_score", 0), r.get("final_block_reason", r.get("phase4_block_reason", "-")), r.get("order_type_hint", "-"), r.get("final_decision", "-"), "是" if r.get("execution_ready") else "否", r.get("decision_reason", "-"), r["display_note"]
                 ),
                 tags=tuple(tags)
             )
@@ -2309,7 +2445,7 @@ class GTCProApp:
             f"追價風險：{'是' if target.get('chase_risk_flag') else '否'} / 下單類型：{target.get('order_type_hint','-')}",
             f"配置分：{target.get('allocation_score','-')} / 資金等級：{target.get('allocation_grade','-')} / 配置倍率：{target.get('allocation_multiplier','-')}",
             f"建議倉位%：{target.get('position_size_pct','-')} / 建議股數：{target.get('suggested_shares','-')} / 風險預算%：{target.get('risk_budget_pct','-')} / 最大損失%：{target.get('max_loss_pct','-')}",
-            f"Phase4阻擋原因：{target.get('phase4_block_reason','') or '-'}",
+            f"Phase4阻擋原因：{target.get('final_block_reason') or target.get('phase4_block_reason','') or '-'}",
             "",
             "【支撐壓力】",
             f"主支撐：{target['support']}",
@@ -2336,7 +2472,7 @@ class GTCProApp:
         return [
             f"【{target['input_symbol']} {target['name']}】交易決策報告",
             "【交易結論】",
-            f"建議：{target['advice']}",
+            f"建議：{target.get('display_advice', target['advice'])}",
             f"訊號：{target['signal']} / 狀態：{target['state_bucket']} / 主升：{target['leader_candidate']}",
             "",
             "【交易計畫】",
@@ -2358,7 +2494,7 @@ class GTCProApp:
             f"進場狀態：{target.get('entry_zone_status','-')} / 可執行：{'是' if target.get('entry_zone_ready') else '否'} / 進場距離%：{target.get('distance_to_entry_pct','-')}",
             f"建議倉位：{target.get('position_size_pct','-')}% / 建議股數：{target.get('suggested_shares','-')} / 風險預算：{target.get('risk_budget_pct','-')}%",
             f"資金等級：{target.get('allocation_grade','-')} / 配置分：{target.get('allocation_score','-')} / 下單類型：{target.get('order_type_hint','-')}",
-            f"阻擋原因：{target.get('phase4_block_reason','') or '-'}",
+            f"阻擋原因：{target.get('final_block_reason') or target.get('phase4_block_reason','') or '-'}",
             "",
             "【風險提醒】",
             target["risk_note"],
@@ -2471,7 +2607,7 @@ class GTCProApp:
             "漲跌": "change",
             "漲跌幅%": "change_pct",
             "訊號": "signal",
-            "建議": "advice",
+            "建議": "display_advice",
             "分數": "score",
             "等級": "strategy_level_score",
             "目標價": "target_price",
@@ -2487,13 +2623,13 @@ class GTCProApp:
             "壓力": "resistance",
             "RSI": "rsi",
             "五檔力道": "orderbook_bias",
-            "交易類型": "trade_type",
+            "交易類型": "display_trade_type",
             "進場狀態": "entry_zone_status",
             "進場可執行": "entry_zone_ready",
             "建議倉位%": "position_size_pct",
             "資金等級": "allocation_grade",
             "配置分": "allocation_score",
-            "阻擋原因": "phase4_block_reason",
+            "阻擋原因": "final_block_reason",
             "下單類型": "order_type_hint",
             "最終決策": "final_decision",
             "可下單": "execution_ready",
@@ -2533,8 +2669,8 @@ class GTCProApp:
         font_name = setup_pdf_font()
         c = canvas.Canvas(file_path, pagesize=landscape(A4))
         width, height = self._export_pdf_header(c, font_name, "總表摘要")
-        headers = ["排名", "燈", "代號", "名稱", "現價", "漲跌%", "訊號", "建議", "分數", "RR", "波浪", "費波", "進場", "倉位%", "資金", "決策"]
-        x_positions = [18, 45, 72, 115, 230, 280, 335, 395, 455, 492, 535, 585, 645, 705, 760, 805]
+        headers = ["排名", "燈", "代號", "名稱", "現價", "漲跌%", "訊號", "建議", "分數", "RR", "波浪", "費波", "進場", "倉位%", "資金", "決策", "可下單"]
+        x_positions = [18, 45, 72, 115, 220, 268, 318, 375, 432, 468, 510, 558, 615, 672, 720, 765, 810]
         y = height - 82
         c.setFont(font_name, 8)
         for h, x in zip(headers, x_positions):
@@ -2550,10 +2686,10 @@ class GTCProApp:
                 c.setFont(font_name, 8)
             row = [
                 str(idx), r["light"], r["input_symbol"], r["name"][:8], str(r["display_price"]),
-                f"{r['change_pct']:+.2f}%", r["signal"][:6], r["advice"][:6], str(r["score"]),
+                f"{r['change_pct']:+.2f}%", r["signal"][:6], r.get("display_advice", r["advice"])[:7], str(r["score"]),
                 str(r["display_rr"]), str(r.get("wave_stage", "-"))[:5], str(r.get("fibo_position", "-"))[:7],
                 str(r.get("entry_zone_status", "-"))[:8], str(r.get("position_size_pct", 0)), str(r.get("allocation_grade", "-")),
-                str(r.get("final_decision", "-"))
+                str(r.get("final_decision", "-")), str(r.get("execution_ready", "-"))
             ]
             for text, x in zip(row, x_positions):
                 c.drawString(x, y, str(text))
@@ -2611,7 +2747,7 @@ class GTCProApp:
         ]
         for idx, r in enumerate(self.results, start=1):
             overview_lines.append(
-                f"{idx}. {r['input_symbol']} {r['name']} / 現價={r['display_price']} / 漲跌幅={r['change_pct']:+.2f}% / 訊號={r['signal']} / 建議={r['advice']} / 分數={r['score']} / 等級={r['strategy_level']} / 目標價={r['display_target_price']} / RR={r['display_rr']} / 主升={r['leader_candidate']} / 波浪={r.get('wave_stage','-')} / 費波={r.get('fibo_position','-')} / 決策={r.get('final_decision','-')}"
+                f"{idx}. {r['input_symbol']} {r['name']} / 現價={r['display_price']} / 漲跌幅={r['change_pct']:+.2f}% / 訊號={r['signal']} / 建議={r.get('display_advice', r['advice'])} / 分數={r['score']} / 等級={r['strategy_level']} / 目標價={r['display_target_price']} / RR={r['display_rr']} / 主升={r['leader_candidate']} / 波浪={r.get('wave_stage','-')} / 費波={r.get('fibo_position','-')} / 決策={r.get('final_decision','-')} / 可下單={r.get('execution_ready','-')} / 阻擋={r.get('final_block_reason','-')}"
             )
         self._draw_wrapped_lines(c, font_name, overview_lines, 24, y, 760)
 
@@ -2670,11 +2806,11 @@ class GTCProApp:
             for idx, r in enumerate(self.results, start=1):
                 writer.writerow([
                     idx, r["light"], r["market"], r["input_symbol"], r["name"], r["display_price"], f"{r['change']:+.2f}",
-                    f"{r['change_pct']:+.2f}%", r["signal"], r["advice"], r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"],
+                    f"{r['change_pct']:+.2f}%", r["signal"], r.get("display_advice", r["advice"]), r["score"], r["strategy_level"], r["display_target_price"], r["display_rr"], r["leader_candidate"],
                     r.get("wave_stage", "-"), r.get("fibo_position", "-"), "是" if (r.get("fibo_risk_flag") or r.get("wave_risk_flag")) else "否", r.get("wave_fibo_signal", "-"),
-                    r.get("entry_zone_status", "-"), r.get("entry_zone_ready", "-"), r.get("distance_to_entry_pct", "-"), r.get("chase_risk_flag", "-"), r.get("position_size_pct", 0), r.get("suggested_shares", 0), r.get("risk_budget_pct", 0), r.get("max_loss_pct", 0), r.get("allocation_grade", "-"), r.get("allocation_score", 0), r.get("phase4_block_reason", "-"), r.get("order_type_hint", "-"), r.get("final_decision", "-"), r.get("execution_ready", "-"), r.get("decision_reason", "-"), r.get("rule_id", "-"), r.get("signal_reason", "-"), r.get("rr_level", "-"),
+                    r.get("entry_zone_status", "-"), r.get("entry_zone_ready", "-"), r.get("distance_to_entry_pct", "-"), r.get("chase_risk_flag", "-"), r.get("position_size_pct", 0), r.get("suggested_shares", 0), r.get("risk_budget_pct", 0), r.get("max_loss_pct", 0), r.get("allocation_grade", "-"), r.get("allocation_score", 0), r.get("final_block_reason", r.get("phase4_block_reason", "-")), r.get("order_type_hint", "-"), r.get("final_decision", "-"), r.get("execution_ready", "-"), r.get("decision_reason", "-"), r.get("rule_id", "-"), r.get("signal_reason", "-"), r.get("rr_level", "-"),
                     r["trend_score"], r["intraday_score"], r["support"], r["resistance"], r["rsi"],
-                    r["orderbook_bias"], r["trade_type"], r["display_note"]
+                    r["orderbook_bias"], r.get("display_trade_type", r["trade_type"]), r["display_note"]
                 ])
         self.set_status(f"已匯出 CSV 主表：{file_path} / 版本：{APP_VERSION}")
         messagebox.showinfo("完成", "CSV：主表資料匯出成功。")
@@ -2687,35 +2823,80 @@ class GTCProApp:
         self.export_pdf_summary()
 
 def validate_phase4_decision_rules():
+    """Phase4 A01-A12 防回歸驗收。"""
     cases = [
         {
+            "id": "A01",
             "name": "BUY 必須進場區有效",
-            "data": {"price_valid": True, "signal": "主升突破", "advice": "拉回加碼", "state_bucket": "strong", "rr": 2.1, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 8, "allocation_score": 85, "fibo_risk_flag": False, "wave_risk_flag": False},
+            "data": {"price_valid": True, "signal": "主升突破", "advice": "拉回加碼", "state_bucket": "strong", "rr": 2.1, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 8, "allocation_score": 85, "allocation_grade": "A", "fibo_risk_flag": False, "wave_risk_flag": False},
             "expected": "BUY",
         },
         {
+            "id": "A02",
+            "name": "ABOVE_ENTRY不可下單",
+            "data": {"price_valid": True, "signal": "強勢追蹤", "advice": "拉回加碼", "state_bucket": "strong", "rr": 2.2, "rr_valid": True, "entry_zone_ready": False, "entry_zone_status": "ABOVE_ENTRY", "position_size_pct": 0, "allocation_score": 82, "allocation_grade": "B", "fibo_risk_flag": False, "wave_risk_flag": False},
+            "expected": "WAIT",
+        },
+        {
+            "id": "A03",
+            "name": "BUY必須倉位大於0",
+            "data": {"price_valid": True, "signal": "主升突破", "advice": "拉回加碼", "state_bucket": "strong", "rr": 2.3, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 0, "allocation_score": 90, "allocation_grade": "A", "fibo_risk_flag": False, "wave_risk_flag": False},
+            "expected": "WAIT",
+        },
+        {
+            "id": "A04",
             "name": "禁追不可BUY",
-            "data": {"price_valid": True, "signal": "末升/禁追風險", "advice": "不追高", "state_bucket": "weak", "rr": 3.0, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "NO_CHASE", "position_size_pct": 8, "allocation_score": 90, "fibo_risk_flag": True, "wave_risk_flag": False},
+            "data": {"price_valid": True, "signal": "末升/禁追風險", "advice": "不追高", "state_bucket": "weak", "rr": 3.0, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "NO_CHASE", "position_size_pct": 8, "allocation_score": 90, "allocation_grade": "A", "fibo_risk_flag": True, "wave_risk_flag": False},
             "expected": "AVOID",
         },
         {
+            "id": "A05",
             "name": "RR不足不可下單",
-            "data": {"price_valid": True, "signal": "強勢追蹤", "advice": "拉回加碼", "state_bucket": "strong", "rr": 1.2, "rr_valid": False, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 3, "allocation_score": 80, "fibo_risk_flag": False, "wave_risk_flag": False},
+            "data": {"price_valid": True, "signal": "強勢追蹤", "advice": "拉回加碼", "state_bucket": "strong", "rr": 1.2, "rr_valid": False, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 3, "allocation_score": 80, "allocation_grade": "B", "fibo_risk_flag": False, "wave_risk_flag": False},
             "expected": "WAIT",
         },
         {
-            "name": "非進場區不可下單",
-            "data": {"price_valid": True, "signal": "強勢追蹤", "advice": "拉回加碼", "state_bucket": "strong", "rr": 2.2, "rr_valid": True, "entry_zone_ready": False, "entry_zone_status": "ABOVE_ENTRY", "position_size_pct": 0, "allocation_score": 82, "fibo_risk_flag": False, "wave_risk_flag": False},
+            "id": "A06",
+            "name": "非即時報價不可下單",
+            "data": {"price_valid": False, "signal": "主升突破", "advice": "拉回加碼", "state_bucket": "strong", "rr": 3.0, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 8, "allocation_score": 90, "allocation_grade": "A", "fibo_risk_flag": False, "wave_risk_flag": False},
             "expected": "WAIT",
+        },
+        {
+            "id": "A07",
+            "name": "Allocation低於70不可BUY",
+            "data": {"price_valid": True, "signal": "主升突破", "advice": "拉回加碼", "state_bucket": "strong", "rr": 2.0, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 4, "allocation_score": 60, "allocation_grade": "C", "fibo_risk_flag": False, "wave_risk_flag": False},
+            "expected": "WAIT",
+        },
+        {
+            "id": "A08",
+            "name": "BLOCK必須AVOID",
+            "data": {"price_valid": True, "signal": "強勢追蹤", "advice": "拉回加碼", "state_bucket": "strong", "rr": 2.5, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "IN_ZONE", "position_size_pct": 8, "allocation_score": 0, "allocation_grade": "BLOCK", "phase4_block_reason": "測試BLOCK", "fibo_risk_flag": False, "wave_risk_flag": False},
+            "expected": "AVOID",
+        },
+        {
+            "id": "A09",
+            "name": "BROKEN必須AVOID",
+            "data": {"price_valid": True, "signal": "跌破支撐", "advice": "減碼/防守", "state_bucket": "weak", "rr": 2.0, "rr_valid": True, "entry_zone_ready": False, "entry_zone_status": "BROKEN", "position_size_pct": 0, "allocation_score": 0, "allocation_grade": "BLOCK", "fibo_risk_flag": False, "wave_risk_flag": False},
+            "expected": "AVOID",
+        },
+        {
+            "id": "A10",
+            "name": "BREAKOUT_CONFIRM小倉可BUY",
+            "data": {"price_valid": True, "signal": "突破強勢", "advice": "突破可追", "state_bucket": "strong", "rr": 2.0, "rr_valid": True, "entry_zone_ready": True, "entry_zone_status": "BREAKOUT_CONFIRM", "position_size_pct": 3, "allocation_score": 75, "allocation_grade": "B", "fibo_risk_flag": False, "wave_risk_flag": False},
+            "expected": "BUY",
         },
     ]
     for case in cases:
         decision = build_final_decision(case["data"])
-        assert decision["final_decision"] == case["expected"], f"Phase4驗收失敗：{case['name']}，得到 {decision['final_decision']}"
+        assert decision["final_decision"] == case["expected"], f"Phase4驗收失敗：{case['id']} {case['name']}，得到 {decision['final_decision']}"
         if decision["final_decision"] == "BUY":
             assert decision["execution_ready"] is True, "BUY 必須 execution_ready=True"
             assert case["data"].get("entry_zone_ready") is True, "BUY 必須 entry_zone_ready=True"
             assert case["data"].get("position_size_pct", 0) > 0, "BUY 必須 position_size_pct>0"
+            assert case["data"].get("allocation_score", 0) >= MIN_BUY_ALLOCATION_SCORE, "BUY 必須 allocation_score達標"
+        else:
+            assert decision["execution_ready"] is False, "非BUY不可 execution_ready=True"
+            assert decision.get("position_size_pct", 0) == 0, "非BUY倉位必須歸零"
     return True
 
 def main():
